@@ -12,6 +12,7 @@ import requests
 import tensorflow as tf
 from tqdm import tqdm
 import math
+from transformers import AutoTokenizer
 # from encoder import get_encoder
 
 @dataclass
@@ -39,12 +40,10 @@ def embed(wembed, tokens): # "d_vocab, d_model", "position" -> "position d_model
     return wembed[tokens]
 
 def pos_embed(wpembed, tokens): # "n_ctx, d_model", "position" -> "position d_model"
-    idxs = np.vstack([np.arange(tokens.shape[1])]*tokens.shape[0])
-    print(f"{idxs.shape=}")
-    return wpembed[idxs]
+    return wpembed[range(len(tokens))]
 
-def unembed(w_u, b_u, x):
-    return np.einsum('se,ev->sv', x, w_u) + b_u
+def unembed(w_u, x):
+    return np.einsum('se,ev->sv', x, w_u)
 
 def rand_float_test(input, fn):
     print("Input shape:", random_input.shape)
@@ -74,7 +73,7 @@ def attention(w_q, w_k, w_v, b_q, b_k, b_v, w_o, b_o, x): # x "seq, d_model"
     # w_k, w_q, w_v, "num_head, d_model, d_head"; w_o "num_head, d_head, d_model"
     # K = w_k@x; Q = w_q@x; A = softmax(apply_casual_mask(QK.T)); 
     # V = w_v@x; z = AV; result = w_o z; atten_out = result.sum(dim=-2)
-    s, e = x.shape
+    e = x.shape[-1]
     n, e, h = w_k.shape
     K = np.einsum('se,enh->snh', x, w_k.reshape(e, n, h)) + b_k # s n h 
     Q = np.einsum('se,enh->snh', x, w_q.reshape(e, n, h)) + b_q # s n h 
@@ -87,7 +86,7 @@ def attention(w_q, w_k, w_v, b_q, b_k, b_v, w_o, b_o, x): # x "seq, d_model"
     return output
 
 # %%
-def parsing_attn_input(x, c_attn, c_proj, n_heads): # w (768x2304), b 2304; c_proj 768x768, 768
+def parse_attn_input(x, c_attn, c_proj, n_heads): # w (768x2304), b 2304; c_proj 768x768, 768
     e, qkvheads = c_attn['w'].shape
     c_attn_rw = c_attn['w'].reshape(qkvheads, e)
     d_head = (qkvheads // 3)//n_heads
@@ -100,24 +99,24 @@ def parsing_attn_input(x, c_attn, c_proj, n_heads): # w (768x2304), b 2304; c_pr
     print(f"{qkv_w.shape=}")
     print(f"{qkv_b.shape=}")
     print(f"{w_o.shape=}")
+    print(f"{x.shape=}")
 
     return attention(qkv_w[0], qkv_w[1], qkv_w[2], qkv_b[0], qkv_b[1], qkv_b[2], w_o, c_proj['b'], x)
-
 
 def gelu(x):
     tanh_val = np.sqrt(2/math.pi) * (x + 0.044715 * np.power(x, 3))
     return 0.5 * x * (1 + (np.exp(2*tanh_val) - 1)/(np.exp(2*tanh_val) + 1))
 
-def mlp(x, w_in, b_in, w_out, b_out):
-    pre = np.einsum('se,em->sm', x, w_in) + b_in
+def mlp_block(x, c_fc, c_proj):
+    pre = np.einsum('se,em->sm', x, c_fc['w']) + c_fc['b']
     post = gelu(pre)
-    mlp_out = np.einsum('sm,me->se', post, w_out) + b_out
+    mlp_out = np.einsum('sm,me->se', post, c_proj['w']) + c_proj['b']
     return mlp_out
 
-def transformer_block(x, c_attn, c_proj, mlp):
-    # mid = attention(layernorm(x)) + x
-    # post = mlp(layernorm(x)) + mid
-    return
+def transformer_block(x, attn, ln_1, ln_2, mlp, n_heads):
+    mid = parse_attn_input(layernorm(x, **ln_1), **attn, n_heads=n_heads) + x
+    post = mlp_block(layernorm(mid, **ln_2), **mlp) + mid
+    return post
 
 #%%
 
@@ -176,7 +175,7 @@ def load_gpt2_params_from_tf_ckpt(tf_ckpt_path, hparams):
     return params
 
 
-def load_encoder_hparams_and_params(model_size, models_dir):
+def load_hparams_and_params(model_size, models_dir):
     assert model_size in ["124M", "355M", "774M", "1558M"]
 
     model_dir = os.path.join(models_dir, model_size)
@@ -185,19 +184,17 @@ def load_encoder_hparams_and_params(model_size, models_dir):
         os.makedirs(model_dir, exist_ok=True)
         download_gpt2_files(model_size, model_dir)
         tf_ckpt_path = tf.train.latest_checkpoint(model_dir)
-
-    # encoder = get_encoder(model_size, models_dir)
     hparams = json.load(open(os.path.join(model_dir, "hparams.json")))
     params = load_gpt2_params_from_tf_ckpt(tf_ckpt_path, hparams)
 
-    return None, hparams, params
+    return hparams, params
 
 # %%
 p = None
 def main(prompt: str, n_tokens_to_generate: int = 40, model_size: str = "124M", models_dir: str = "models"):
 
     # load encoder, hparams, and params from the released open-ai gpt-2 files
-    encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
+    hparams, params = load_hparams_and_params(model_size, models_dir)
 
     return params, hparams
     print(f"{params=}")
@@ -216,35 +213,62 @@ def main(prompt: str, n_tokens_to_generate: int = 40, model_size: str = "124M", 
     # return output_text
 p, hparams = main('today im testing this')
 # %%
-print(len(p['blocks'])) # dict_keys(['blocks', 'ln_f', 'wpe', 'wte']) 
+# print((p['blocks'])) # dict_keys(['blocks', 'ln_f', 'wpe', 'wte']) 
 # dict_keys(['attn', 'ln_1', 'ln_2', 'mlp']) # in a list of 12
 
-print(p['blocks'][0]['attn'].keys()) # dict_keys(['c_attn', 'c_proj'])
-print(p['blocks'][0]['attn']['c_attn'].keys()) # dict_keys(['b', 'w'])
-print(p['blocks'][0]['attn']['c_proj'].keys()) # dict_keys(['b', 'w'])
+print(p['blocks'][0]['mlp']['c_fc'].keys()) # dict_keys(['c_attn', 'c_proj'])
+print(p['blocks'][0]['mlp']['c_proj'].keys())
+# print(p['blocks'][0]['attn']['c_attn'].keys()) # dict_keys(['b', 'w'])
+# print(p['blocks'][0]['attn']['c_proj'].keys()) # dict_keys(['b', 'w'])
 
-# blocks [{'attn': {'c_attn': , 'c_proj'}}, {'ln_1': }, {l_2: }]
-# print(p['wte'].shape) # (50257, 768)
-print(len(p['blocks'][0]['attn']['c_proj']['w'])) # 768
-print(len(p['blocks'][0]['attn']['c_proj']['b'])) # 2304
-print(p['blocks'][0]['attn']['c_proj']['w'][0].shape) # (768x2304)
-print(p['blocks'][0]['attn']['c_proj']['b'][0]) # 2304x1
+# # blocks [{'attn': {'c_attn': , 'c_proj'}}, {'ln_1': }, {l_2: }]
+# # print(p['wte'].shape) # (50257, 768)
+# print(len(p['blocks'][0]['attn']['c_proj']['w'])) # 768
+# print(len(p['blocks'][0]['attn']['c_proj']['b'])) # 2304
+# print(p['blocks'][0]['attn']['c_proj']['w'][0].shape) # (768x2304)
+# print(p['blocks'][0]['attn']['c_proj']['b'][0]) # 2304x1
 # %%
 qkv = p['blocks'][0]['attn']['c_attn']['w']
 np.split(qkv, 3, axis=-1)[0].shape
 #%%
-parsing_attn_input(np.random.rand(2,768), **p['blocks'][0]['attn'], n_heads=hparams["n_head"])
+# parsing_attn_input(np.random.rand(2,768), **p['blocks'][0]['attn'], n_heads=hparams["n_head"])
 #%%
 
+def gpt2(tokens, wte, wpe, blocks, ln_f, hparams):
+    print(f"{wte.shape=}")
+    print(f"{wpe.shape=}")
+    x = embed(wte, tokens) + pos_embed(wpe, tokens)
+    print(f"{x.shape=}")
+    for b in blocks:
+        x = transformer_block(x, **b, n_heads=hparams["n_head"])
+
+    logits = unembed(wte.T, layernorm(x, **ln_f))
+    return logits
     
+def run_gpt2(input):
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    hparams, params = load_hparams_and_params("124M", "models")
+    
+    tokens = tokenizer(input).input_ids
+    print(f"{tokens=}")
+    result_t = []
+    for i in tqdm(range(20)):
+        logits = gpt2(tokens, **params, hparams=hparams)
+        next_token_id = logits[-1,:].argmax(-1)
+        print(f"{next_token_id=}")
+        result_t.append(next_token_id)
+    
+    return tokenizer.batch_decode(result_t)
 
 
+import json
+def params_to_json():
+    def ndarray_to_list(arr):
+        """Converts a NumPy ndarray to a list."""
+        return arr.tolist()
+    with open('result.json', 'w') as fp:
+        json.dump(p, fp, default=ndarray_to_list)
 
-# import json
-# def ndarray_to_list(arr):
-#     """Converts a NumPy ndarray to a list."""
-#     return arr.tolist()
-# with open('result.json', 'w') as fp:
-#     json.dump(p, fp, default=ndarray_to_list)
-
+# %%
+print(run_gpt2('i am testing'))
 # %%
